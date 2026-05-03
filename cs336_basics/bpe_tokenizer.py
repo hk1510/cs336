@@ -3,7 +3,7 @@ from typing import BinaryIO
 from .pretokenization_example import find_chunk_boundaries
 
 class BPETokenizer:
-    
+
     def __init__(self, vocab_size: int, special_tokens: list[str]):
 
         self.vocab = special_tokens + [bytes([i]) for i in range(256)]
@@ -18,7 +18,7 @@ class BPETokenizer:
         self.pretokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""" 
 
     def tokenize(self, file_path: str):
-        
+
         with open(file_path, "rb") as f:
             num_processes = 4
             boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
@@ -30,5 +30,3 @@ class BPETokenizer:
                 chunk = f.read(end - start).decode("utf-8", errors="ignore")
                 # Run pre-tokenization on your chunk and store the counts for each pre-token
                 for pretok in re.finditer(self.pretokenize_pattern, chunk):
-
-        
