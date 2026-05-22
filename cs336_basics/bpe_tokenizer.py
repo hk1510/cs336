@@ -4,6 +4,9 @@ from collections import defaultdict
 from multiprocessing import Process, Queue
 from typing import Protocol, TypeAlias, cast
 import mmap
+import os
+import pickle
+import time
 
 PretokenCounts: TypeAlias = dict[tuple[bytes, ...], int]
 
@@ -23,7 +26,7 @@ class BPETokenizer:
         self.vocab: dict[int, bytes] = {}
 
         for i in range(256):
-            self.vocab[i + len(special_tokens)] = bytes([i])
+            self.vocab[i] = bytes([i])
 
         min_vocab_size = len(self.vocab)
 
@@ -38,14 +41,18 @@ class BPETokenizer:
             r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         )
 
-        self.counts_cache: dict[tuple[bytes, bytes], list[dict[tuple[bytes, ...], int]]]= {}
+        self.counts_cache: dict[
+            tuple[bytes, bytes], list[dict[tuple[bytes, ...], int]]
+        ] = {}
 
-    # {lo: 7, ow: 7, we: 8, er: 2, wi: 3, id: 3, de: 3, es: 9, st: 9, ne: 6, ew: 6}
-    #
-
-    def create_byte_pair_dict(self, pretok_dict: dict[tuple[bytes, ...], int]) -> tuple[dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], set[tuple[bytes, ...]]]]:
+    def create_byte_pair_dict(self, pretok_dict: dict[tuple[bytes, ...], int]) -> tuple[
+        dict[tuple[bytes, bytes], int],
+        dict[tuple[bytes, bytes], set[tuple[bytes, ...]]],
+    ]:
         byte_pair_dict: dict[tuple[bytes, bytes], int] = defaultdict(int)
-        byte_pair_pretok_dict: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
+        byte_pair_pretok_dict: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = (
+            defaultdict(set)
+        )
         for key in pretok_dict:
             for i in range(len(key) - 1):
                 pair = (key[i], key[i + 1])
@@ -54,27 +61,27 @@ class BPETokenizer:
         return byte_pair_dict, byte_pair_pretok_dict
 
     def merge(
-            self, pretok_dict: dict[tuple[bytes, ...], int], byte_pair_dict: dict[tuple[bytes, bytes], int], byte_pair_pretok_dict: dict[tuple[bytes, bytes], set[tuple[bytes,...]]]
+        self,
+        pretok_dict: dict[tuple[bytes, ...], int],
+        byte_pair_dict: dict[tuple[bytes, bytes], int],
+        byte_pair_pretok_dict: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]],
     ) -> tuple[bytes, bytes] | None:
-        sorted_pairs = sorted(
-            byte_pair_dict.items(), key=lambda item: (item[1], *item[0]), reverse=True
-        )
-        if len(sorted_pairs) == 0:
+        if len(byte_pair_dict) == 0:
             return None
 
-        merge_pair = sorted_pairs[0][0]
-
-        print("MERGING: ", merge_pair[0], merge_pair[1])
-        self.vocab[len(self.vocab) + len(self.special_tokens)] = (
-            merge_pair[0] + merge_pair[1]
+        max_pair = max(
+            byte_pair_dict.items(), key=lambda item: (item[1], *item[0])
         )
-       
-        # TODO: Add merged pair + pretok counts to byte pair dict
-        # TODO: Subtract pretok counts from bytes that occur before and after merged pair
+
+        merge_pair = max_pair[0]
+        new_token = merge_pair[0] + merge_pair[1]
+
+        self.vocab[len(self.vocab)] = new_token
+        del byte_pair_dict[merge_pair]
         for pretok in byte_pair_pretok_dict[merge_pair]:
             new_key: list[bytes] | tuple[bytes, ...] = []
-            contains_merge = False
             merged = False
+            modified_index_pairs: set[tuple[int, int]] = set()
             for i in range(len(pretok)):
                 if merged == True:
                     merged = False
@@ -84,18 +91,46 @@ class BPETokenizer:
                     continue
                 if merge_pair[0] == pretok[i] and merge_pair[1] == pretok[i + 1]:
                     merged = True
-                    contains_merge = True
-                    new_key.append(merge_pair[0] + merge_pair[1])
-                    if i > 0:
-                        byte_pair_dict[(pretok[i-1], pretok[i])] -= pretok_dict[pretok]
-                    
+                    new_key.append(new_token)
 
+                    if i > 0:
+                        left_pair = (pretok[i - 1], pretok[i])
+                        if (i - 1, i) not in modified_index_pairs:
+                            byte_pair_dict[left_pair] -= pretok_dict[pretok]
+                            if byte_pair_dict[left_pair] <= 0:
+                                del byte_pair_dict[left_pair]
+                            modified_index_pairs.add((i-1, i))
+                    if i < len(pretok) - 2:
+                        right_pair = (pretok[i + 1], pretok[i + 2])
+                        if (i + 1, i + 2) not in modified_index_pairs:
+                            byte_pair_dict[right_pair] -= pretok_dict[pretok]
+                            if byte_pair_dict[right_pair] <= 0:
+                                del byte_pair_dict[right_pair]
+                            modified_index_pairs.add((i + 1, i + 2))
                 else:
                     new_key.append(pretok[i])
+
             new_key = tuple(new_key)
-            if contains_merge:
-                pretok_dict[new_key] = pretok_dict[pretok]
-                del pretok_dict[pretok]
+            pretok_dict[new_key] += pretok_dict[pretok]
+            del pretok_dict[pretok]
+
+            for i in range(len(new_key)):
+                if new_key[i] == new_token:
+                    if i > 0:
+                        byte_pair_dict[(new_key[i - 1], new_token)] += pretok_dict[
+                            new_key
+                        ]
+                    if i < len(new_key) - 1:
+                        byte_pair_dict[(new_token, new_key[i + 1])] += pretok_dict[
+                            new_key
+                        ]
+                if i < len(new_key) - 1:
+                    byte_pair_pretok_dict[(new_key[i], new_key[i + 1])].add(new_key)
+                    if pretok in byte_pair_pretok_dict[(new_key[i], new_key[i + 1])]:
+                        byte_pair_pretok_dict[(new_key[i], new_key[i + 1])].remove(
+                            pretok
+                        )
+
         return merge_pair
 
     def pretokenize_chunk(
@@ -110,6 +145,7 @@ class BPETokenizer:
             )
             chunk_pretok_dict: PretokenCounts = defaultdict(int)
             for sub_chunk in sub_chunks:
+                #
                 for pretok in re.finditer(self.pretokenize_pattern, sub_chunk):
                     byte_tuple: tuple[bytes, ...] = tuple(
                         bytes([i]) for i in pretok.group().encode()
@@ -118,12 +154,11 @@ class BPETokenizer:
                         chunk_pretok_dict[byte_tuple] += 1
             queue.put(chunk_pretok_dict)
 
-    def train(
-        self, file_path: str
+    def train_bpe(
+        self, file_path: str | os.PathLike, num_processes = 8,
     ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
         with open(file_path, "rb") as f:
-            num_processes = 8
             boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
         pretok_dict: dict[tuple[bytes, ...], int] = defaultdict(int)
@@ -149,23 +184,31 @@ class BPETokenizer:
 
         for i in range(num_chunks):
             processes[i].join()
-        
-        print('Pretokenization complete')
+
+        print("Pretokenization complete")
 
         byte_pair_dict, byte_pair_pretok_dict = self.create_byte_pair_dict(pretok_dict)
 
         merges: list[tuple[bytes, bytes]] = []
-        while len(self.vocab) < self.vocab_size:
+        while len(self.vocab) < self.vocab_size - len(self.special_tokens):
             merge = self.merge(pretok_dict, byte_pair_dict, byte_pair_pretok_dict)
-            if merge:
-                merges.append(merge)
+            if merge is None:
+                break
+            merges.append(merge)
+
+        vocab_length = len(self.vocab)
+        for i, token in enumerate(self.special_tokens):
+            self.vocab[vocab_length + i] = token.encode("utf-8")
+
         return self.vocab, merges
 
 
 if __name__ == "__main__":
-    tokenizer = BPETokenizer(vocab_size=10000, special_tokens=["<|endoftext|>"])
-    vocab, merges = tokenizer.train("data/TinyStoriesV2-GPT4-train.txt")
-    for merge in merges:
-        print([x for x in merge])
-
-    print(vocab)
+    tokenizer = BPETokenizer(vocab_size=32000, special_tokens=["<|endoftext|>"])
+    # vocab, merges = tokenizer.train("data/TinyStoriesV2-GPT4-train.txt")
+    start_time = time.time()
+    vocab, merges = tokenizer.train_bpe("data/owt_train.txt")
+    end_time = time.time()
+    print("Time Taken:", end_time - start_time)
+    with open("owt_vocab_and_merges.pkl", "wb") as f:
+        pickle.dump((vocab, merges), f)
